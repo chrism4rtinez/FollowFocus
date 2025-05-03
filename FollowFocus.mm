@@ -28,7 +28,7 @@
 #include <Carbon/Carbon.h>
 #include <libproc.h>
 
-#define FollowFocus_VERSION "5.3"
+#define FollowFocus_VERSION "1.0.0"
 #define STACK_THRESHOLD 20
 
 #ifdef EXPERIMENTAL_FOCUS_FIRST

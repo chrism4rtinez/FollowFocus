@@ -9,7 +9,7 @@
     <key>CFBundleGetInfoString</key>
     <string>CM</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.0</string>
     <key>CFBundleIconFile</key>
     <string>FollowFocus</string>
     <key>CFBundleName</key>
