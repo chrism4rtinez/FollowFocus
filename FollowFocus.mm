@@ -27,8 +27,9 @@
 #include <AppKit/AppKit.h>
 #include <Carbon/Carbon.h>
 #include <libproc.h>
+#include <errno.h>
 
-#define FollowFocus_VERSION "5.3"
+#define FollowFocus_VERSION "1.0.0"
 #define STACK_THRESHOLD 20
 
 #ifdef EXPERIMENTAL_FOCUS_FIRST
@@ -139,6 +140,10 @@ static int disableKey = 0;
 // https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
 void window_manager_make_key_window(ProcessSerialNumber * _window_psn, uint32_t window_id) {
     uint8_t * bytes = (uint8_t *) malloc(0xf8);
+    if (!bytes) {
+        if (verbose) { NSLog(@"Failed to allocate memory for window_manager_make_key_window"); }
+        return;
+    }
     memset(bytes, 0, 0xf8);
 
     bytes[0x04] = 0xf8;
@@ -166,6 +171,10 @@ void window_manager_focus_window_without_raise(
         if (same_process) {
             if (verbose) { NSLog(@"Same process"); }
             uint8_t * bytes = (uint8_t *) malloc(0xf8);
+            if (!bytes) {
+                if (verbose) { NSLog(@"Failed to allocate memory in window_manager_focus_window_without_raise"); }
+                return;
+            }
             memset(bytes, 0, 0xf8);
 
             bytes[0x04] = 0xf8;
@@ -203,8 +212,12 @@ inline void activate(pid_t pid) {
     if (!error) { SetFrontProcessWithOptions(&process, kSetFrontProcessFrontWindowOnly); }
 #else
     // Note activateWithOptions does not work properly on OSX 11.1
-    [[NSRunningApplication runningApplicationWithProcessIdentifier: pid]
-        activateWithOptions: NSApplicationActivateIgnoringOtherApps];
+    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: pid];
+    if (app) {
+        [app activateWithOptions: NSApplicationActivateIgnoringOtherApps];
+    } else if (verbose) {
+        NSLog(@"Failed to get NSRunningApplication for PID: %d", pid);
+    }
 #endif
 }
 
@@ -212,12 +225,16 @@ inline void raiseAndActivate(AXUIElementRef _window, pid_t window_pid) {
     if (verbose) { NSLog(@"Raise"); }
     if (AXUIElementPerformAction(_window, kAXRaiseAction) == kAXErrorSuccess) {
         activate(window_pid);
+    } else if (verbose) {
+        NSLog(@"Failed to raise window");
     }
 }
 
 // TODO: does not take into account different languages
 inline bool titleEquals(AXUIElementRef _element, NSArray * _titles, NSArray * _patterns = NULL, bool logTitle = false) {
     bool equal = false;
+    if (!_element) return false;
+    
     CFStringRef _elementTitle = NULL;
     AXUIElementCopyAttributeValue(_element, kAXTitleAttribute, (CFTypeRef *) &_elementTitle);
     if (logTitle) { NSLog(@"element title: %@", _elementTitle); }
@@ -226,7 +243,19 @@ inline bool titleEquals(AXUIElementRef _element, NSArray * _titles, NSArray * _p
         equal = [_titles containsObject: _title];
         if (!equal && _patterns) {
             for (NSString * _pattern in _patterns) {
-                equal = [_title rangeOfString:_pattern options:NSRegularExpressionSearch].location != NSNotFound;
+                if (!_pattern) continue;
+                NSError *error = nil;
+                NSRegularExpression *regex = [NSRegularExpression 
+                    regularExpressionWithPattern:_pattern 
+                    options:0 
+                    error:&error];
+                if (error) {
+                    if (verbose) { NSLog(@"Invalid regex pattern: %@, error: %@", _pattern, error); }
+                    continue;
+                }
+                equal = [regex numberOfMatchesInString:_title 
+                        options:0 
+                        range:NSMakeRange(0, [_title length])] > 0;
                 if (equal) { break; }
             }
         }
@@ -237,6 +266,8 @@ inline bool titleEquals(AXUIElementRef _element, NSArray * _titles, NSArray * _p
 
 inline bool dock_active() {
     bool active = false;
+    if (!_dock_app) return false;
+    
     AXUIElementRef _focusedUIElement = NULL;
     AXUIElementCopyAttributeValue(_dock_app, kAXFocusedUIElementAttribute, (CFTypeRef *) &_focusedUIElement);
     if (_focusedUIElement) {
@@ -249,14 +280,22 @@ inline bool dock_active() {
 
 NSDictionary * topwindow(CGPoint point) {
     NSDictionary * top_window = NULL;
-    NSArray * window_list = (NSArray *) CFBridgingRelease(CGWindowListCopyWindowInfo(
+    CFArrayRef windowListRef = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID));
+        kCGNullWindowID);
+        
+    if (!windowListRef) {
+        if (verbose) { NSLog(@"CGWindowListCopyWindowInfo failed"); }
+        return NULL;
+    }
+    
+    NSArray * window_list = (NSArray *) CFBridgingRelease(windowListRef);
 
     for (NSDictionary * window in window_list) {
-        NSDictionary * window_bounds_dict = window[(NSString *) CFBridgingRelease(kCGWindowBounds)];
+        NSDictionary * window_bounds_dict = window[(NSString *)kCGWindowBounds];
+        if (!window_bounds_dict) continue;
 
-        if (![window[(__bridge id) kCGWindowLayer] isEqual: @0]) { continue; }
+        if (![window[(NSString *)kCGWindowLayer] isEqual: @0]) { continue; }
 
         NSRect window_bounds = NSMakeRect(
             [window_bounds_dict[@"X"] intValue],
@@ -281,8 +320,20 @@ AXUIElementRef fallback(CGPoint point) {
         CFTypeRef _windows_cf = NULL;
         pid_t pid = [top_window[(__bridge id) kCGWindowOwnerPID] intValue];
         AXUIElementRef _window_owner = AXUIElementCreateApplication(pid);
-        AXUIElementCopyAttributeValue(_window_owner, kAXWindowsAttribute, &_windows_cf);
+        if (!_window_owner) {
+            if (verbose) { NSLog(@"Failed to create application element for PID: %d", pid); }
+            return NULL;
+        }
+        
+        AXError error = AXUIElementCopyAttributeValue(_window_owner, kAXWindowsAttribute, &_windows_cf);
         CFRelease(_window_owner);
+        
+        if (error != kAXErrorSuccess) {
+            if (verbose) { NSLog(@"Failed to get windows from application: %d", error); }
+            activate(pid);
+            return NULL;
+        }
+        
         if (_windows_cf) {
             NSArray * application_windows = (NSArray *) CFBridgingRelease(_windows_cf);
             CGWindowID top_window_id = [top_window[(__bridge id) kCGWindowNumber] intValue];
@@ -318,8 +369,13 @@ AXUIElementRef get_raisable_window(AXUIElementRef _element, CGPoint point, int c
                 NSLog(@"Stack threshold reached");
                 pid_t application_pid;
                 if (AXUIElementGetPid(_element, &application_pid) == kAXErrorSuccess) {
-                    proc_pidpath(application_pid, pathBuffer, sizeof(pathBuffer));
-                    NSLog(@"Application path: %s", pathBuffer);
+                    ssize_t path_len = proc_pidpath(application_pid, pathBuffer, sizeof(pathBuffer));
+                    if (path_len <= 0) {
+                        NSLog(@"Failed to get process path: %s", strerror(errno));
+                    } else {
+                        pathBuffer[sizeof(pathBuffer) - 1] = '\0'; // Ensure null termination
+                        NSLog(@"Application path: %s", pathBuffer);
+                    }
                 }
             }
             CFRelease(_element);
@@ -379,6 +435,11 @@ AXUIElementRef get_raisable_window(AXUIElementRef _element, CGPoint point, int c
 }
 
 AXUIElementRef get_mousewindow(CGPoint point) {
+    if (!_accessibility_object) {
+        if (verbose) { NSLog(@"Accessibility object is null"); }
+        return NULL;
+    }
+    
     AXUIElementRef _element = NULL;
     AXError error = AXUIElementCopyElementAtPosition(_accessibility_object, point.x, point.y, &_element);
 
@@ -420,6 +481,8 @@ AXUIElementRef get_mousewindow(CGPoint point) {
 
 CGPoint get_mousepoint(AXUIElementRef _window) {
     CGPoint mousepoint = {0, 0};
+    if (!_window) return mousepoint;
+    
     AXValueRef _size = NULL;
     AXValueRef _pos = NULL;
     AXUIElementCopyAttributeValue(_window, kAXSizeAttribute, (CFTypeRef *) &_size);
@@ -443,6 +506,8 @@ CGPoint get_mousepoint(AXUIElementRef _window) {
 
 bool contained_within(AXUIElementRef _window1, AXUIElementRef _window2) {
     bool contained = false;
+    if (!_window1 || !_window2) return false;
+    
     AXValueRef _size1 = NULL;
     AXValueRef _size2 = NULL;
     AXValueRef _pos1 = NULL;
@@ -482,6 +547,11 @@ bool contained_within(AXUIElementRef _window1, AXUIElementRef _window2) {
 
 void findDockApplication() {
     NSArray * _apps = [[NSWorkspace sharedWorkspace] runningApplications];
+    if (!_apps) {
+        if (verbose) { NSLog(@"Failed to get running applications"); }
+        return;
+    }
+    
     for (NSRunningApplication * app in _apps) {
         if ([app.bundleIdentifier isEqual: DockBundleId]) {
             _dock_app = AXUIElementCreateApplication(app.processIdentifier);
@@ -493,9 +563,15 @@ void findDockApplication() {
 }
 
 void findDesktopOrigin() {
-    NSScreen * main_screen = NSScreen.screens[0];
+    NSArray *screens = [NSScreen screens];
+    if (!screens || screens.count == 0) {
+        if (verbose) { NSLog(@"No screens found"); }
+        return;
+    }
+    
+    NSScreen * main_screen = screens[0];
     float mainScreenTop = NSMaxY(main_screen.frame);
-    for (NSScreen * screen in [NSScreen screens]) {
+    for (NSScreen * screen in screens) {
         float screenOriginY = mainScreenTop - NSMaxY(screen.frame);
         if (screenOriginY < desktopOrigin.y) { desktopOrigin.y = screenOriginY; }
         if (screen.frame.origin.x < desktopOrigin.x) { desktopOrigin.x = screen.frame.origin.x; }
@@ -505,9 +581,15 @@ void findDesktopOrigin() {
 }
 
 inline NSScreen * findScreen(CGPoint point) {
-    NSScreen * main_screen = NSScreen.screens[0];
+    NSArray *screens = [NSScreen screens];
+    if (!screens || screens.count == 0) {
+        if (verbose) { NSLog(@"No screens found"); }
+        return NULL;
+    }
+    
+    NSScreen * main_screen = screens[0];
     point.y = NSMaxY(main_screen.frame) - point.y;
-    for (NSScreen * screen in [NSScreen screens]) {
+    for (NSScreen * screen in screens) {
         NSRect screen_bounds = NSMakeRect(
             screen.frame.origin.x,
             screen.frame.origin.y,
@@ -523,6 +605,8 @@ inline NSScreen * findScreen(CGPoint point) {
 
 inline bool is_desktop_window(AXUIElementRef _window) {
     bool desktop_window = false;
+    if (!_window) return false;
+    
     AXValueRef _pos = NULL;
     AXUIElementCopyAttributeValue(_window, kAXPositionAttribute, (CFTypeRef *) &_pos);
     if (_pos) {
@@ -538,6 +622,8 @@ inline bool is_desktop_window(AXUIElementRef _window) {
 
 inline bool is_full_screen(AXUIElementRef _window) {
     bool full_screen = false;
+    if (!_window) return false;
+    
     AXValueRef _pos = NULL;
     AXUIElementCopyAttributeValue(_window, kAXPositionAttribute, (CFTypeRef *) &_pos);
     if (_pos) {
@@ -550,9 +636,16 @@ inline bool is_full_screen(AXUIElementRef _window) {
                 if (_size) {
                     CGSize cg_size;
                    if (AXValueGetValue(_size, (AXValueType)kAXValueCGSizeType, &cg_size)) {
+                        NSArray *screens = [NSScreen screens];
+                        if (!screens || screens.count == 0) {
+                            CFRelease(_size);
+                            CFRelease(_pos);
+                            return false;
+                        }
+                        
                         float menuBarHeight =
                             fmax(0, NSMaxY(screen.frame) - NSMaxY(screen.visibleFrame) - 1);
-                        NSScreen * main_screen = NSScreen.screens[0];
+                        NSScreen * main_screen = screens[0];
                         float screenOriginY = NSMaxY(main_screen.frame) - NSMaxY(screen.frame);
                         full_screen = cg_pos.x == NSMinX(screen.frame) &&
                                       cg_pos.y == screenOriginY + menuBarHeight &&
@@ -572,6 +665,8 @@ inline bool is_full_screen(AXUIElementRef _window) {
 
 inline bool is_main_window(AXUIElementRef _app, AXUIElementRef _window, bool chrome_app) {
     bool main_window = false;
+    if (!_app || !_window) return false;
+    
     CFBooleanRef _result = NULL;
     AXUIElementCopyAttributeValue(_window, kAXMainAttribute, (CFTypeRef *) &_result);
     if (_result) {
@@ -600,6 +695,7 @@ inline bool is_main_window(AXUIElementRef _app, AXUIElementRef _window, bool chr
 }
 
 inline bool is_chrome_app(NSString * bundleIdentifier) {
+    if (!bundleIdentifier) return false;
     NSArray * components = [bundleIdentifier componentsSeparatedByString: @"."];
     return components.count > 4 && [components[2] isEqual: @"Chrome"] && [components[3] isEqual: @"app"];
 }
@@ -679,6 +775,11 @@ static MDWorkspaceWatcher * workspaceWatcher = NULL;
 
 #ifdef FOCUS_FIRST
 - (void)windowFocused:(AXUIElementRef)_window {
+    if (_window == NULL) {
+        if (verbose) { NSLog(@"Cannot focus null window"); }
+        return;
+    }
+    
     if (verbose) { NSLog(@"Window focused, waiting %0.3fs", raiseDelayCount*pollMillis/1000.0); }
     [self performSelector: @selector(onWindowFocused:)
         withObject: [NSNumber numberWithUnsignedLong: (uint64_t) _window]
@@ -731,6 +832,8 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
 
 @implementation ConfigClass
 - (NSString *) getFilePath:(NSString *) filename {
+    if (!filename) return NULL;
+    
     filename = [NSString stringWithFormat: @"%@/%@", NSHomeDirectory(), filename];
     if (not [[NSFileManager defaultManager] fileExistsAtPath: filename]) { filename = NULL; }
     return filename;
@@ -740,6 +843,10 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
     if (argc > 1) {
         // read NSArgumentDomain
         NSUserDefaults *arguments = [NSUserDefaults standardUserDefaults];
+        if (!arguments) {
+            NSLog(@"Failed to get NSUserDefaults");
+            return;
+        }
 
         for (id key in parametersDictionary) {
             id arg = [arguments objectForKey: key];
@@ -748,11 +855,12 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
     } else {
         [self readHiddenConfig];
     }
-      // Enforce sane bounds
-      int poll = [parameters[kPollMillis] intValue];
-      if (poll < 20 || poll > 1000) { parameters[kPollMillis] = @50; }
-      float deltaVal = [parameters[kMouseDelta] floatValue];
-      if (deltaVal < 0.0f || deltaVal > 10.0f) { parameters[kMouseDelta] = @0.0f; }
+    
+    // Enforce sane bounds
+    int poll = [parameters[kPollMillis] intValue];
+    if (poll < 20 || poll > 1000) { parameters[kPollMillis] = @50; }
+    float deltaVal = [parameters[kMouseDelta] floatValue];
+    if (deltaVal < 0.0f || deltaVal > 10.0f) { parameters[kMouseDelta] = @0.0f; }
     return;
 }
 
@@ -764,21 +872,34 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
     if (delayFilePath || warpFilePath) {
         NSFileHandle *hDelayFile = [NSFileHandle fileHandleForReadingAtPath: delayFilePath];
         if (hDelayFile) {
-            parameters[kDelay] = @(abs([[[NSString alloc]
-                initWithData: [hDelayFile readDataOfLength: 2]
-                encoding: NSUTF8StringEncoding] intValue]));
+            NSData *data = [hDelayFile readDataOfLength: 2];
+            if (data) {
+                NSString *delayStr = [[NSString alloc] initWithData: data encoding: NSUTF8StringEncoding];
+                if (delayStr) {
+                    parameters[kDelay] = @(abs([delayStr intValue]));
+                }
+            }
             [hDelayFile closeFile];
         }
 
         NSFileHandle *hWarpFile = [NSFileHandle fileHandleForReadingAtPath: warpFilePath];
         if (hWarpFile) {
-            NSString *line = [[NSString alloc]
-                initWithData: [hWarpFile readDataOfLength:11]
-                encoding: NSUTF8StringEncoding];
-            NSArray *components = [line componentsSeparatedByString: @" "];
-            if (components.count >= 1) { parameters[kWarpX] = @([[components objectAtIndex:0] floatValue]); }
-            if (components.count >= 2) { parameters[kWarpY] = @([[components objectAtIndex:1] floatValue]); }
-            if (components.count >= 3) { parameters[kScale] = @([[components objectAtIndex:2] floatValue]); }
+            NSData *data = [hWarpFile readDataOfLength: 11];
+            if (data) {
+                NSString *line = [[NSString alloc] initWithData: data encoding: NSUTF8StringEncoding];
+                if (line) {
+                    NSArray *components = [line componentsSeparatedByString: @" "];
+                    if (components.count >= 1) { 
+                        parameters[kWarpX] = @([[components objectAtIndex:0] floatValue]); 
+                    }
+                    if (components.count >= 2) { 
+                        parameters[kWarpY] = @([[components objectAtIndex:1] floatValue]); 
+                    }
+                    if (components.count >= 3) { 
+                        parameters[kScale] = @([[components objectAtIndex:2] floatValue]); 
+                    }
+                }
+            }
             [hWarpFile closeFile];
         }
     }
@@ -786,8 +907,9 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
 }
 
 - (void) readHiddenConfig {
-      NSNumberFormatter *formatter = [[NSNumberFormatter alloc] init];
-      formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSNumberFormatter *formatter = [[NSNumberFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    
     // search for dotfiles
     NSString *hiddenConfigFilePath = [self getFilePath: @".FollowFocus"];
     if (!hiddenConfigFilePath) { hiddenConfigFilePath = [self getFilePath: @".config/FollowFocus/config"]; }
@@ -797,13 +919,18 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
         NSString *configContent = [[NSString alloc]
             initWithContentsOfFile: hiddenConfigFilePath
             encoding: NSUTF8StringEncoding error: &error];
+            
+        if (error) {
+            NSLog(@"Error reading config file: %@", error);
+            return;
+        }
 
         NSArray *configLines = [configContent componentsSeparatedByString:@"\n"];
         NSString *trimmedLine, *trimmedKey, *trimmedValue, *noQuotesValue;
         NSArray *components;
         for (NSString *line in configLines) {
             trimmedLine = [line stringByTrimmingCharactersInSet: [NSCharacterSet whitespaceCharacterSet]];
-            if (not [trimmedLine hasPrefix:@"#"]) {
+            if (trimmedLine.length > 0 && ![trimmedLine hasPrefix:@"#"]) {
                 components = [trimmedLine componentsSeparatedByString:@"="];
                 if ([components count] == 2) {
                     for (id key in parametersDictionary) {
@@ -811,11 +938,18 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
                        trimmedValue = [components[1] stringByTrimmingCharactersInSet: [NSCharacterSet whitespaceCharacterSet]];
                        noQuotesValue = [trimmedValue stringByReplacingOccurrencesOfString:@"\"" withString:@""];
                        if ([trimmedKey isEqual:key]) {
-                           NSNumber *number = [formatter numberFromString:noQuotesValue];
-                           if (number != nil) {
-                               parameters[key] = number;
+                           if (noQuotesValue.length > 0) {
+                               NSNumber *number = [formatter numberFromString:noQuotesValue];
+                               if (number != nil) {
+                                   parameters[key] = number;
+                               } else if ([noQuotesValue isEqualToString:@"true"] || 
+                                         [noQuotesValue isEqualToString:@"false"]) {
+                                   parameters[key] = @([noQuotesValue isEqualToString:@"true"]);
+                               } else {
+                                   parameters[key] = noQuotesValue;
+                               }
                            } else {
-                               NSLog(@"Invalid config value for %@: %@", key, noQuotesValue);
+                               NSLog(@"Empty config value for %@", key);
                            }
                        }
                     }
@@ -835,21 +969,35 @@ NSMutableDictionary *parameters = [[NSMutableDictionary alloc] init];
 #else
     if (!parameters[kDelay]) {
 #endif
-        parameters[kDelay] = @"1";
+        parameters[kDelay] = @1;
     }
-    if ([parameters[kPollMillis] intValue] < 20) { parameters[kPollMillis] = @"50"; }
-    if ([parameters[kMouseDelta] floatValue] < 0) { parameters[kMouseDelta] = @"0"; }
-    if ([parameters[kScale] floatValue] < 1) { parameters[kScale] = @"2.0"; }
-    if (!parameters[kDisableKey]) { parameters[kDisableKey] = @"control"; }
+    if (!parameters[kPollMillis] || [parameters[kPollMillis] intValue] < 20) { 
+        parameters[kPollMillis] = @50; 
+    }
+    if (!parameters[kMouseDelta] || [parameters[kMouseDelta] floatValue] < 0) { 
+        parameters[kMouseDelta] = @0; 
+    }
+    if (!parameters[kScale] || [parameters[kScale] floatValue] < 1) { 
+        parameters[kScale] = @2.0; 
+    }
+    if (!parameters[kDisableKey]) { 
+        parameters[kDisableKey] = @"control"; 
+    }
     warpMouse =
         parameters[kWarpX] && [parameters[kWarpX] floatValue] >= 0 && [parameters[kWarpX] floatValue] <= 1 &&
         parameters[kWarpY] && [parameters[kWarpY] floatValue] >= 0 && [parameters[kWarpY] floatValue] <= 1;
 #ifdef ALTERNATIVE_TASK_SWITCHER
-    if (!parameters[kAltTaskSwitcher]) { parameters[kAltTaskSwitcher] = @"true"; }
+    if (!parameters[kAltTaskSwitcher]) { 
+        parameters[kAltTaskSwitcher] = @YES; 
+    }
 #endif
 #ifdef FOCUS_FIRST
-    if (![parameters[kDelay] intValue] && !parameters[kFocusDelay]) { parameters[kFocusDelay] = @"1"; }
-    if (!parameters[kDelay] && ![parameters[kFocusDelay] intValue]) { parameters[kDelay] = @"1"; }
+    if (![parameters[kDelay] intValue] && !parameters[kFocusDelay]) { 
+        parameters[kFocusDelay] = @1; 
+    }
+    if (!parameters[kDelay] && ![parameters[kFocusDelay] intValue]) { 
+        parameters[kDelay] = @1; 
+    }
 #endif
     return;
 }
@@ -871,10 +1019,20 @@ bool appActivated() {
     appWasActivated = true;
 
     NSRunningApplication *frontmostApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (!frontmostApp) {
+        if (verbose) { NSLog(@"Failed to get frontmost application"); }
+        return false;
+    }
+    
     pid_t frontmost_pid = frontmostApp.processIdentifier;
 
     AXUIElementRef _activatedWindow = NULL;
     AXUIElementRef _frontmostApp = AXUIElementCreateApplication(frontmost_pid);
+    if (!_frontmostApp) {
+        if (verbose) { NSLog(@"Failed to create application element for frontmost app"); }
+        return false;
+    }
+    
     AXUIElementCopyAttributeValue(_frontmostApp,
         kAXMainWindowAttribute, (CFTypeRef *) &_activatedWindow);
     if (!_activatedWindow) {
@@ -900,8 +1058,14 @@ bool appActivated() {
 
     if (altTaskSwitcher) {
         CGEventRef _event = CGEventCreate(NULL);
+        if (!_event) {
+            if (verbose) { NSLog(@"Failed to create CGEvent"); }
+            if (!finder_app && _activatedWindow) { CFRelease(_activatedWindow); }
+            return false;
+        }
+        
         CGPoint mousePoint = CGEventGetLocation(_event);
-        if (_event) { CFRelease(_event); }
+        CFRelease(_event);
 
         bool ignoreActivated = false;
         // TODO: is the uncorrected mousePoint good enough?
@@ -946,8 +1110,13 @@ bool appActivated() {
 void onTick() {
     // determine if mouseMoved
     CGEventRef _event = CGEventCreate(NULL);
+    if (!_event) {
+        if (verbose) { NSLog(@"Failed to create CGEvent in onTick"); }
+        return;
+    }
+    
     CGPoint mousePoint = CGEventGetLocation(_event);
-    if (_event) { CFRelease(_event); }
+    CFRelease(_event);
 
     float mouse_x_diff = mousePoint.x-oldPoint.x;
     float mouse_y_diff = mousePoint.y-oldPoint.y;
@@ -982,7 +1151,12 @@ void onTick() {
                 mousePoint.x += mouse_x_diff > 0 ? WINDOW_CORRECTION : -WINDOW_CORRECTION;
                 mousePoint.y += mouse_y_diff > 0 ? WINDOW_CORRECTION : -WINDOW_CORRECTION;
                 if (screen) {
-                    NSScreen * main_screen = NSScreen.screens[0];
+                    NSArray *screens = [NSScreen screens];
+                    if (!screens || screens.count == 0) {
+                        return;
+                    }
+                    
+                    NSScreen * main_screen = screens[0];
                     float screenOriginX = NSMinX(screen.frame) - NSMinX(main_screen.frame);
                     float screenOriginY = NSMaxY(main_screen.frame) - NSMaxY(screen.frame);
 
@@ -1049,13 +1223,15 @@ void onTick() {
 
         if (!abort && disableKey) {
             CGEventRef _keyDownEvent = CGEventCreateKeyboardEvent(NULL, 0, true);
-            CGEventFlags flags = CGEventGetFlags(_keyDownEvent);
-            if (_keyDownEvent) { CFRelease(_keyDownEvent); }
-            abort = (flags & disableKey) == disableKey;
+            if (_keyDownEvent) {
+                CGEventFlags flags = CGEventGetFlags(_keyDownEvent);
+                CFRelease(_keyDownEvent);
+                abort = (flags & disableKey) == disableKey;
+            }
         }
 
         NSRunningApplication *frontmostApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
-        abort = abort || [stayFocusedBundleIds containsObject: frontmostApp.bundleIdentifier];
+        abort = abort || (frontmostApp && [stayFocusedBundleIds containsObject: frontmostApp.bundleIdentifier]);
 
         if (abort) {
             if (verbose) { NSLog(@"Abort focus/raise"); }
@@ -1070,10 +1246,22 @@ void onTick() {
             if (AXUIElementGetPid(_mouseWindow, &mouseWindow_pid) == kAXErrorSuccess) {
                 bool needs_raise = !invertIgnoreApps;
                 AXUIElementRef _mouseWindowApp = AXUIElementCreateApplication(mouseWindow_pid);
+                if (!_mouseWindowApp) {
+                    if (verbose) { NSLog(@"Failed to create application element for mouse window"); }
+                    CFRelease(_mouseWindow);
+                    return;
+                }
+                
                 if (needs_raise && titleEquals(_mouseWindow, @[NoTitle, Untitled])) {
-                    needs_raise = is_main_window(_mouseWindowApp, _mouseWindow, is_chrome_app(
-                        [NSRunningApplication runningApplicationWithProcessIdentifier:
-                        mouseWindow_pid].bundleIdentifier));
+                    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: mouseWindow_pid];
+                    if (!app) {
+                        if (verbose) { NSLog(@"Failed to get NSRunningApplication for mouse window"); }
+                        CFRelease(_mouseWindowApp);
+                        CFRelease(_mouseWindow);
+                        return;
+                    }
+                    
+                    needs_raise = is_main_window(_mouseWindowApp, _mouseWindow, is_chrome_app(app.bundleIdentifier));
                     if (verbose && !needs_raise) { NSLog(@"Excluding window"); }
                 } else if (needs_raise &&
                     titleEquals(_mouseWindow, @[BartenderBar, Zim, AppStoreSearchResults], ignoreTitles)) {
@@ -1101,9 +1289,28 @@ void onTick() {
                 ProcessSerialNumber * _focusedWindow_psn = NULL;
 #endif
                 if (needs_raise) {
-                    _AXUIElementGetWindow(_mouseWindow, &mouseWindow_id);
+                    AXError axError = _AXUIElementGetWindow(_mouseWindow, &mouseWindow_id);
+                    if (axError != kAXErrorSuccess) {
+                        if (verbose) { NSLog(@"Failed to get window ID: %d", axError); }
+                        CFRelease(_mouseWindow);
+                        return;
+                    }
+                    
+                    NSRunningApplication *frontmostApp = [[NSWorkspace sharedWorkspace] frontmostApplication];
+                    if (!frontmostApp) {
+                        if (verbose) { NSLog(@"Failed to get frontmost application"); }
+                        CFRelease(_mouseWindow);
+                        return;
+                    }
+                    
                     pid_t frontmost_pid = frontmostApp.processIdentifier;
                     AXUIElementRef _frontmostApp = AXUIElementCreateApplication(frontmost_pid);
+                    if (!_frontmostApp) {
+                        if (verbose) { NSLog(@"Failed to create application element for frontmost app"); }
+                        CFRelease(_mouseWindow);
+                        return;
+                    }
+                    
                     AXUIElementRef _focusedWindow = NULL;
                     AXUIElementCopyAttributeValue(
                         _frontmostApp,
@@ -1117,7 +1324,16 @@ void onTick() {
                             NSLog(@"Focused window: %@", _windowTitle);
                             if (_windowTitle) { CFRelease(_windowTitle); }
                         }
-                        _AXUIElementGetWindow(_focusedWindow, &focusedWindow_id);
+                        
+                        axError = _AXUIElementGetWindow(_focusedWindow, &focusedWindow_id);
+                        if (axError != kAXErrorSuccess) {
+                            if (verbose) { NSLog(@"Failed to get window ID: %d", axError); }
+                            CFRelease(_focusedWindow);
+                            CFRelease(_frontmostApp);
+                            CFRelease(_mouseWindow);
+                            return;
+                        }
+                        
                         needs_raise = mouseWindow_id != focusedWindow_id;
 #ifdef FOCUS_FIRST
                         if (raiseDelayCount) {
@@ -1368,29 +1584,57 @@ int main(int argc, const char * argv[]) {
 #endif
         printf("\n");
 
+        // Display an alert to users about the permissions required
         NSDictionary * options = @{(id) CFBridgingRelease(kAXTrustedCheckOptionPrompt): @YES};
         bool trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef) options);
         if (!trusted) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            [alert setMessageText:@"Accessibility Permission Required"];
+            [alert setInformativeText:@"FollowFocus requires accessibility permissions to function. This allows the app to detect window positions and interact with them. Please enable this in System Preferences > Security & Privacy > Privacy > Accessibility."];
+            [alert addButtonWithTitle:@"OK"];
+            [alert runModal];
             NSLog(@"Accessibility permission required. Exiting.");
             return 1;
         }
         if (verbose) { NSLog(@"AXIsProcessTrusted: %s", trusted ? "YES" : "NO"); }
 
-        CGSGetCursorScale(CGSMainConnectionID(), &oldScale);
+        CGError error = CGSGetCursorScale(CGSMainConnectionID(), &oldScale);
+        if (error != kCGErrorSuccess) {
+            NSLog(@"Failed to get system cursor scale: %d", error);
+            oldScale = 1.0;
+        }
         if (verbose) { NSLog(@"System cursor scale: %f", oldScale); }
 
-        CFRunLoopSourceRef runLoopSource = NULL;
-        eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
-            CGEventMaskBit(kCGEventMouseMoved),
-            eventTapHandler, NULL);
-        if (eventTap) {
-            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
-            if (runLoopSource) {
-                CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
-                CGEventTapEnable(eventTap, true);
+        // Clean up any resources from previous runs
+        if (_accessibility_object == NULL) {
+            _accessibility_object = AXUIElementCreateSystemWide();
+            if (!_accessibility_object) {
+                NSLog(@"Failed to create system-wide accessibility object. Exiting.");
+                return 1;
             }
         }
-        if (verbose) { NSLog(@"Got run loop source: %s", runLoopSource ? "YES" : "NO"); }
+        
+        CFRunLoopSourceRef runLoopSource = NULL;
+        eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+            CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown),
+            eventTapHandler, NULL);
+        if (!eventTap) {
+            NSLog(@"Failed to create event tap. Exiting.");
+            return 1;
+        }
+        
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
+        if (!runLoopSource) {
+            NSLog(@"Failed to create run loop source. Exiting.");
+            CFRelease(eventTap);
+            return 1;
+        }
+        
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+        CGEventTapEnable(eventTap, true);
+        CFRelease(runLoopSource);
+        
+        if (verbose) { NSLog(@"Got run loop source: YES"); }
 
         workspaceWatcher = [[MDWorkspaceWatcher alloc] init];
 #ifdef FOCUS_FIRST
@@ -1404,6 +1648,34 @@ int main(int argc, const char * argv[]) {
         findDockApplication();
         findDesktopOrigin();
         [[NSApplication sharedApplication] run];
+        
+        // Cleanup resources
+        if (eventTap) {
+            CGEventTapEnable(eventTap, false);
+            CFRelease(eventTap);
+        }
+        
+        if (_accessibility_object) {
+            CFRelease(_accessibility_object);
+            _accessibility_object = NULL;
+        }
+        
+        if (_previousFinderWindow) {
+            CFRelease(_previousFinderWindow);
+            _previousFinderWindow = NULL;
+        }
+        
+        if (_dock_app) {
+            CFRelease(_dock_app);
+            _dock_app = NULL;
+        }
+        
+#ifdef FOCUS_FIRST
+        if (_lastFocusedWindow) {
+            CFRelease(_lastFocusedWindow);
+            _lastFocusedWindow = NULL;
+        }
+#endif
     }
     return 0;
 }

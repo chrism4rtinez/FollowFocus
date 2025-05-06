@@ -1,5 +1,5 @@
 SKYLIGHT_AVAILABLE := $(shell test -d /System/Library/PrivateFrameworks/SkyLight.framework && echo 1 || echo 0)
-override CXXFLAGS += -O2 -Wall -fobjc-arc -D"NS_FORMAT_ARGUMENT(A)=" -D"SKYLIGHT_AVAILABLE=$(SKYLIGHT_AVAILABLE)"
+override CXXFLAGS += -O2 -Wall -fobjc-arc -D"NS_FORMAT_ARGUMENT(A)=" -D"SKYLIGHT_AVAILABLE=$(SKYLIGHT_AVAILABLE)" -DEXPERIMENTAL_FOCUS_FIRST
 
 .PHONY: all clean install
 
@@ -21,4 +21,5 @@ FollowFocus: FollowFocus.mm
         endif
 
 FollowFocus.app: FollowFocus Info.plist FollowFocus.icns
+	chmod +x ./create-app-bundle.sh
 	./create-app-bundle.sh
